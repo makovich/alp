@@ -1,0 +1,270 @@
+#!/bin/bash
+#---help---
+# alp 1.0
+#
+# Usage: alp [ ... qemu args ... ]
+#
+# This is generally a fancy QEMU wrapper that runs Alpine Linux *-virt
+# from the ISO image and binds host's $PWD as a guest's USB device.
+# Any *.apkovl.tar.gz at $PWD will be used during Alpine bootup.
+#
+# It can repack LBU's apkovl if it comes from 'sys' or 'data' modes so
+# this let 'diskless' mode become a kind of a clone for throwaway tests.
+# It is also o `bkp` tool companion (think of `etckeeper` for `lbu`).
+#
+# Environment:
+#   ALPINE_ISO     Path to Alpine Linux image to spin up
+#                  (i.e. "~/alpine-img/alpine-virt-3.12.0-x86_64.iso")
+#
+#   VER            Alpine version to use (i.e. "3.12.4"),
+#                  defaults to the latest at ALPINE_ISO_DIR
+#
+#   OVL            Apkovl path/filename or `.` to autodetect in $PWD
+#
+# Homepage: <https://github.com/makovich/alp>
+# See also: <https://github.com/makovich/bkp>
+#---help---
+set -e
+
+# readonly ALPINE_ISO_DIR=
+: ${ALPINE_ISO_DIR:?"Please, set parameter at the top of the file or export variable"}
+
+readonly PERMS_FILE='/etc/lbu/perms.bkp'    # name shared with `bkp` tool
+readonly ALP_WORKDIR='.alp'
+readonly ISO_PATTERN='alpine-virt-*-x86_64.iso'
+readonly QEMU_PROG='qemu-system-x86_64'
+
+help() {
+  sed -n '/^#---help---/,/^#---help---/p' "$0" | sed 's/^# \{0,1\}//; 1d;$d;'
+}
+
+die() {
+  echo "ERROR: $2" >&2
+  exit "$1"
+}
+
+main() {
+  if ! command -v "${QEMU_PROG}" >/dev/null 2>&1; then
+    die 1 'No QEMU found.'
+  fi
+
+  "${QEMU_PROG}" "${QEMU_ARGS[@]}" "$@"
+}
+
+find_iso() {
+  local isodir="$1"
+  local release=${2:-"`ls -1r $isodir/${ISO_PATTERN} | head -n1 | xargs basename | cut -d- -f3`"}
+  local iso="$isodir/${ISO_PATTERN/\*/$release}"
+
+  [ -f "$iso" ] && echo $iso || die 2 "No \'$iso\' file found"
+}
+
+gen_openrc_service() {
+  local perms_file="$1"
+
+  cat <<EOF
+#!/sbin/openrc-run
+
+description="Apkovl hook service"
+
+have_rootfs()
+{
+    grep -q "root=UUID=" /proc/cmdline
+}
+
+depend()
+{
+    after dev-mount
+    before *
+    have_rootfs || need modloop
+}
+
+start_pre()
+{
+    # Do not start service when kernel parameters have root partition.
+    #
+    # Alpine booting from ISO have in memory root filesystem.
+    # If apkovl content replaces /etc or other paths then
+    # several points have to be addressed accordingly and that is
+    # what the rest of this OpenRC service do.
+    have_rootfs && exit 0
+
+    # Report ok otherwise
+    return 0
+}
+
+start()
+{
+    # Passwordless root login
+    sed -i 's/root:.*/root:::0:::::/' /etc/shadow
+
+    # Restore permissions
+    [ -f "$perms_file" ] && sh "$perms_file" && chown root: /
+
+    # Load OverlayFS module and restart modloop service
+    modprobe overlay
+    [ -L /lib/modules ] && rm /lib/modules
+    [ -L /lib/firmware ] && rm /lib/firmware
+    rc-service --nodeps modloop restart
+
+    # Hook networking services
+    cat > /etc/init.d/apkovl-net <<-'EOF'
+	#!/sbin/openrc-run
+	depend()
+	{
+	    before networking
+	}
+	start()
+	{
+	    local sshd="/usr/sbin/sshd"
+	
+	    # Use fresh interfaces configuration
+	    setup-interfaces -a
+	    ifup -a
+	
+	    # Allow SSHD passwordless root
+	    [ -x "$sshd" ] && "$sshd" \\
+	      -o Port=22 \\
+	      -o PermitRootLogin=yes \\
+	      -o PermitEmptyPasswords=yes \\
+	      -o AuthenticationMethods=any \\
+	      -o PasswordAuthentication=yes \\
+	    && mark_service_started sshd
+	
+	    # Remove itself from runlevel
+	    rc-update del apkovl-net boot
+	    rm /etc/init.d/apkovl-net
+	}
+	EOF
+
+    cat > /etc/init.d/apkovl-local <<-'EOF'
+	#!/sbin/openrc-run
+	depend()
+	{
+	    after *
+	}
+	start()
+	{
+	    # Remount underlaying usbdisk device as /media/usb
+	    umount \$(readlink -fn /dev/usbdisk)
+	    mount /media/usb
+	
+	    # Install packages (from cache maybe)
+	    setup-apkcache /media/usb/cache
+	    apk add
+	
+	    # Remove itself from the runlevel
+	    rc-update del apkovl-local default
+	    rm /etc/init.d/apkovl-local
+	}
+	EOF
+
+    chmod +x /etc/init.d/apkovl-net
+    chmod +x /etc/init.d/apkovl-local
+    rc-update add apkovl-net boot
+    rc-update add apkovl-local default
+    rc-update -u
+
+    mark_service_started
+}
+EOF
+}
+
+make_apkovl() {
+  local perms_file="$1"
+  local wrkdir="$2"
+  local rundir="$3"
+  local ovl="$4"
+
+  local repack=`[ -f "$ovl" ] && mktemp -dt alp`
+  local initd="/etc/init.d"
+  local runlvl="/etc/runlevels/sysinit"
+  local svc="$initd/apkovl"
+
+  if [ "$repack" ]; then
+    mkdir -p "$repack"
+    tar -xzf "$ovl" -C "$repack"
+    cd "$repack"
+  fi
+
+  # Generate helper service
+  mkdir -p ".$initd"
+  gen_openrc_service "$perms_file" > ".$svc"
+  chmod +x ".$svc"
+
+  # Add service to sysinit runlevel
+  mkdir -p ".$runlvl"
+  ln -s "$svc" ".$runlvl/apkovl" 2>/dev/null
+
+  [ "$repack" ] && cd "$rundir"
+
+  # Create Alpine overlay archive
+  mkdir -p "$rundir/$wrkdir/cache"
+  tar \
+    --exclude "$wrkdir/" \
+    --exclude ".git/" \
+    --exclude "*.apkovl.*" \
+    -czf "$rundir/$wrkdir/alp.apkovl.tar.gz" \
+    -C "${repack:-$rundir}" .
+
+  [ "$repack" ] && rm -rf "$repack"
+}
+
+
+decide_mnt_dir() {
+  local ovl=$1
+  local mntdir="`pwd`"
+  local candidates=`ls -1 *.apkovl.tar.gz 2>/dev/null`
+
+  if [ "$ovl" = "." ]; then
+    if [ -d "etc/apk" ]; then
+      ovl=$ovl
+    elif [ 1 -eq `echo "$candidates" | wc -w` ]; then
+      ovl=$candidates
+    else
+      ovl=
+    fi
+  fi
+
+  case "$ovl" in
+    *'.apkovl.tar.gz' | '.')
+      make_apkovl "${PERMS_FILE}" "${ALP_WORKDIR}" "$mntdir" "$ovl"
+      echo "$mntdir/${ALP_WORKDIR}"
+      ;;
+    SKIP | *)
+      echo "$mntdir"
+      ;;
+  esac
+}
+
+while getopts ":h" o; do
+  case "$o" in
+    h) help; exit 0;;
+  esac
+done
+
+QEMU_ARGS=(
+  -m 1G,slots=3,maxmem=4G
+  -nographic
+
+  # enable osx hardware acceleration (Linux, OSX)
+  -machine accel=kvm:hvf
+
+  # path to alpine iso
+  -cdrom "${ALPINE_ISO:-"`find_iso ${ALPINE_ISO_DIR} ${VER}`"}"
+
+  # boot order (d - first cdrom, c - first hdd)
+  -boot order=cd,once=d
+
+  # map current directory to /media/usb and allow alpine load apkovl from it
+  -machine usb=on
+  -device qemu-xhci
+  -device usb-storage,drive=stick
+  -drive format=raw,if=none,id=stick,file=fat:rw:"`decide_mnt_dir ${OVL:-'SKIP'}`"
+
+  # network interface
+  -nic user
+  # -nic user,hostfwd=tcp::10080-:80,hostfwd=tcp::10022-:22,hostfwd=tcp::10443-:443
+)
+
+main "$@"
