@@ -95,8 +95,8 @@ start_pre()
 
 start()
 {
-    # Passwordless root login
-    sed -i 's/root:.*/root:::0:::::/' /etc/shadow
+    # Empty password root
+    echo "root:" | chpasswd --md5
 
     # Restore permissions
     [ -f "$perms_file" ] && sh "$perms_file" && chown root: /
