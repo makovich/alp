@@ -112,7 +112,7 @@ start()
 	#!/sbin/openrc-run
 	depend()
 	{
-	    before networking
+	    before networking sshd
 	}
 	start()
 	{
@@ -123,7 +123,7 @@ start()
 	    ifup -a
 	
 	    # Allow SSHD passwordless root
-	    [ -x "$sshd" ] && "$sshd" \\
+	    [ -x "\$sshd" ] && "\$sshd" \\
 	      -o Port=22 \\
 	      -o PermitRootLogin=yes \\
 	      -o PermitEmptyPasswords=yes \\
